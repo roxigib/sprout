@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="theme-color" content="#f7f4fb" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#16141c" media="(prefers-color-scheme: dark)">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="robots" content="noindex, nofollow">
+<meta name="description" content="Private, offline baby tracker: feeds, sleep, diapers, pumping, meds and growth.">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<title>Sprout Baby Log</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <button class="baby" data-action="tab" data-tab="settings" aria-label="Baby profile">
+      <span class="avatar">🌱</span>
+      <span class="baby-text">
+        <strong id="babyName">Baby</strong>
+        <small id="babyAge">Set birth date in Settings</small>
+      </span>
+    </button>
+    <button class="icon-btn" data-action="toggle-theme" aria-label="Toggle dark mode" id="themeBtn">🌙</button>
+  </header>
+
+  <main id="view" tabindex="-1"></main>
+
+  <nav class="tabbar" aria-label="Sections">
+    <button data-action="tab" data-tab="home" class="active"><span>🏠</span>Home</button>
+    <button data-action="tab" data-tab="log"><span>📋</span>Timeline</button>
+    <button data-action="tab" data-tab="stats"><span>📈</span>Trends</button>
+    <button data-action="tab" data-tab="settings"><span>⚙️</span>Settings</button>
+  </nav>
+
+  <div id="backdrop" hidden></div>
+  <section id="sheet" role="dialog" aria-modal="true" hidden></section>
+  <div id="toast" role="status" aria-live="polite" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
