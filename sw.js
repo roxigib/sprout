@@ -1,5 +1,5 @@
 // Offline support: serve the app from cache, refresh the cache in the background.
-const CACHE = 'sprout-v4';
+const CACHE = 'sprout-v5';
 const ASSETS = ['./', 'index.html', 'styles.css', 'app.js', 'sync.js', 'firebase-config.js', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png'];
 // The Firebase SDK (versioned, never changes) is cached so sharing also starts offline.
 const isFirebaseSdk = url => url.origin === 'https://www.gstatic.com' && url.pathname.startsWith('/firebasejs/');

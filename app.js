@@ -892,7 +892,6 @@ function readForm(type, form, e) {
       if (!l && !r) throw new Error('Enter minutes for at least one side');
       d.left = Math.round(l * 60); d.right = Math.round(r * 60); d.last = fd.get('last') || 'L';
       const end = optEnd();
-      if (end != null && end - start < (d.left + d.right) * 1000 - MIN) throw new Error('Left + right minutes are longer than the time between start and end');
       out.end = end ?? start + (d.left + d.right) * 1000; break;
     }
     case 'sleep': {
@@ -931,6 +930,7 @@ function openForm(type, e = null) {
       </div>
     </form>`);
   const form = $('#entryForm');
+  if (type === 'nurse') syncNurseTimes(form);
   form.onsubmit = async ev => {
     ev.preventDefault();
     let entry;
@@ -953,6 +953,52 @@ function openForm(type, e = null) {
   };
 }
 
+// Keep nursing start/end and left/right minutes consistent while editing.
+// Changing start or end adds/removes the difference on the "Ended on" side
+// (spilling over to the other side). Changing the minutes moves the end time
+// to start + left + right.
+function syncNurseTimes(form) {
+  const el = n => form.elements[n];
+  const mins = n => parseFloat(el(n).value) || 0;
+  const setM = (n, v) => { el(n).value = v > 0.05 ? String(round(v, 1)) : ''; };
+  const span = () => {
+    const s = fromLocalInput(el('start').value), e = fromLocalInput(el('end').value);
+    return isFinite(s) && isFinite(e) && e > s ? (e - s) / MIN : null;
+  };
+  const sides = () => (el('last').value === 'R' ? ['right', 'left'] : ['left', 'right']);
+  let prev = span();
+  const onTimes = () => {
+    const sp = span();
+    if (sp == null) { prev = null; return; }
+    const [a, b] = sides(), total = mins(a) + mins(b);
+    if (!total) setM(a, sp);
+    else if (prev == null) {
+      if (total > sp) { const k = sp / total; setM(a, mins(a) * k); setM(b, mins(b) * k); }
+    } else {
+      let delta = sp - prev;
+      if (delta >= 0) setM(a, mins(a) + delta);
+      else {
+        let cut = -delta;
+        for (const n of [a, b]) { const c = Math.min(cut, mins(n)); setM(n, mins(n) - c); cut -= c; }
+      }
+    }
+    prev = sp;
+  };
+  const onMins = () => {
+    const start = fromLocalInput(el('start').value), total = mins('left') + mins('right');
+    if (!isFinite(start) || !el('end').value || !total) return;
+    el('end').value = toLocalInput(start + Math.round(total) * MIN);
+    prev = span();
+  };
+  const handle = ev => {
+    const n = ev.target.name;
+    if (n === 'start' || n === 'end') onTimes();
+    else if (n === 'left' || n === 'right') onMins();
+  };
+  form.addEventListener('input', handle);
+  form.addEventListener('change', handle); // some mobile date pickers only fire change
+}
+
 function pickPast() {
   const opts = [['nurse', '🤱 Nursing'], ['sleep', '😴 Sleep'], ['bottle', '🍼 Bottle'], ['diaper', '🧷 Diaper'], ['pump', '🥛 Pumping'], ['med', '💊 Medicine'], ['growth', '📏 Growth']];
   openSheet(`<h3 class="sheet-title">🕘 Add a past entry</h3>
@@ -967,12 +1013,14 @@ document.addEventListener('click', ev => {
   if (b.dataset.ago != null) {
     const inp = sheet().querySelector(`input[name="${b.dataset.for}"]`);
     inp.value = toLocalInput(Date.now() - (+b.dataset.ago) * MIN);
+    inp.dispatchEvent(new Event('input', { bubbles: true }));
     b.parentElement.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
   } else if (b.dataset.delta) {
     const w = b.closest('.stepper'), inp = w.querySelector('input');
     const step = +w.dataset.step, dec = +w.dataset.dec;
     const v = (parseFloat(inp.value) || 0) + step * +b.dataset.delta;
     inp.value = Math.max(0, round(v, Math.max(dec, 2))).toString();
+    inp.dispatchEvent(new Event('input', { bubbles: true }));
     vibrate(6);
   } else if (b.dataset.set) {
     sheet().querySelector(`input[name="${b.dataset.set}"]`).value = b.dataset.v;
