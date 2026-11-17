@@ -257,6 +257,9 @@ main { padding: 4px 16px 24px; max-width: 640px; margin: 0 auto; outline: none; 
 .sheet-actions .btn.danger { flex: 0 0 auto; }
 .type-pick { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
 
+/* Elements with display set (toast, sheet) must still disappear when hidden. */
+[hidden] { display: none !important; }
+
 /* ---------- toast ---------- */
 #toast {
   position: fixed; left: 12px; right: 12px; bottom: calc(84px + var(--safe-b)); z-index: 60;

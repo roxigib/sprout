@@ -42,7 +42,7 @@ const toLocalInput = t => { const d = new Date(t); return `${d.getFullYear()}-${
 const fromLocalInput = s => (s ? new Date(s).getTime() : NaN);
 
 // =====================================================================
-// Storage (IndexedDB, all data stays on the phone)
+// Storage (IndexedDB on the phone; optionally mirrored to a shared log, see sync.js)
 // =====================================================================
 const DB = {
   db: null,
@@ -80,19 +80,65 @@ const S = {
   tab: 'home', filter: 'all', days: 7, sel: {}, installPrompt: null, persisted: null,
 };
 
+let Sync = null; // shared-log module, loaded at boot when firebase-config.js is filled in
 const sortEntries = () => S.entries.sort((a, b) => b.start - a.start);
 async function addEntry(e) {
-  e.id = e.id || uid(); e.created = e.created || Date.now();
-  S.entries.push(e); sortEntries(); await DB.put(e); return e;
+  e.id = e.id || uid(); e.created = e.created || Date.now(); e.updated = Date.now();
+  S.entries = S.entries.filter(x => x.id !== e.id); S.entries.push(e); sortEntries();
+  await DB.put(e); Sync?.pushEntry(e); return e;
 }
 async function updateEntry(e) {
+  e.updated = Date.now();
   const i = S.entries.findIndex(x => x.id === e.id);
   if (i >= 0) S.entries[i] = e; else S.entries.push(e);
-  sortEntries(); await DB.put(e);
+  sortEntries(); await DB.put(e); Sync?.pushEntry(e);
 }
-async function deleteEntry(id) { S.entries = S.entries.filter(x => x.id !== id); await DB.del(id); }
+async function deleteEntry(id) { S.entries = S.entries.filter(x => x.id !== id); await DB.del(id); Sync?.pushDelete(id); }
 const saveSettings = () => DB.set('settings', S.settings);
-const saveTimers = () => DB.set('timers', S.timers);
+async function saveTimers() { S.timers.updated = Date.now(); await DB.set('timers', S.timers); Sync?.pushTimers(); }
+// Baby name & birth date are shared with the family; units/theme stay per phone.
+async function saveProfile() { S.settings.profileUpdated = Date.now(); await saveSettings(); Sync?.pushProfile(); }
+
+// ---------- Applying changes that arrive from the shared log ----------
+const stampOf = e => e.updated || e.created || 0;
+let renderQueued = false;
+function renderSoon() {
+  if (renderQueued) return;
+  renderQueued = true;
+  setTimeout(() => {
+    renderQueued = false;
+    // Don't wipe what someone is typing in Settings; re-render once they leave the field.
+    const a = document.activeElement;
+    if (a && $('#view').contains(a) && /INPUT|TEXTAREA|SELECT/.test(a.tagName)) { a.addEventListener('blur', renderSoon, { once: true }); return; }
+    render();
+  }, 50);
+}
+const syncBridge = {
+  state: () => S,
+  changed: renderSoon,
+  async applyEntries(list) {
+    const byId = new Map(S.entries.map(e => [e.id, e]));
+    const puts = [], dels = [];
+    for (const r of list) {
+      const cur = byId.get(r.id);
+      if (r.deleted) { if (cur && stampOf(r) >= stampOf(cur)) { byId.delete(r.id); dels.push(r.id); } }
+      else if (TYPES[r.type] && isFinite(r.start) && r.data && (!cur || stampOf(r) > stampOf(cur))) { byId.set(r.id, r); puts.push(r); }
+    }
+    if (!puts.length && !dels.length) return;
+    S.entries = [...byId.values()]; sortEntries();
+    if (puts.length) await DB.putMany(puts);
+    for (const id of dels) await DB.del(id);
+    renderSoon();
+  },
+  async applyTimers(t) {
+    S.timers = { sleep: t.sleep || null, nurse: t.nurse || null, updated: t.updated };
+    await DB.set('timers', S.timers); renderSoon();
+  },
+  async applyProfile(p) {
+    Object.assign(S.settings, { babyName: p.babyName || 'Baby', birth: p.birth ?? null, profileUpdated: p.updated });
+    await saveSettings(); renderSoon();
+  },
+};
 
 // =====================================================================
 // Units
@@ -302,9 +348,15 @@ async function nursePause() {
   if (n.since) nurseFreeze(n, now); else n.since = now;
   await saveTimers(); render();
 }
-async function nurseSave() {
+async function nurseSave(endAt) {
   const n = S.timers.nurse; if (!n) return;
-  const now = Date.now(); nurseFreeze(n, now);
+  let now = Date.now(); nurseFreeze(n, now);
+  if (endAt != null && endAt < now) {
+    // Trim the time after the chosen end, starting with the side that was active last
+    let extra = now - endAt; const sides = n.side === 'L' ? ['left', 'right'] : ['right', 'left'];
+    for (const k of sides) { const cut = Math.min(extra, n[k]); n[k] -= cut; extra -= cut; }
+    now = endAt;
+  }
   const left = Math.round(n.left / 1000), right = Math.round(n.right / 1000);
   S.timers.nurse = null; await saveTimers();
   if (left + right < 5) { toast('Timer under 5 seconds — not saved'); render(); return; }
@@ -315,9 +367,9 @@ async function sleepStart() {
   S.timers.sleep = { start: Date.now() }; vibrate(); await saveTimers(); render();
   toast('Sleep timer started 😴');
 }
-async function sleepSave() {
+async function sleepSave(endAt) {
   const t = S.timers.sleep; if (!t) return;
-  const now = Date.now(); S.timers.sleep = null; await saveTimers();
+  const now = endAt ?? Date.now(); S.timers.sleep = null; await saveTimers();
   if (now - t.start < 30 * 1000) { toast('Sleep under 30 seconds — not saved'); render(); return; }
   const e = await addEntry({ type: 'sleep', start: t.start, end: now, data: {}, note: '' });
   vibrate(25); render(); toastLogged(e, `Sleep saved · ${fmtDur(now - t.start)}`);
@@ -329,22 +381,29 @@ async function timerDiscard(which) {
 function timerAdjust(which) {
   const cur = which === 'nurse' ? S.timers.nurse.startedAt : S.timers.sleep.start;
   openSheet(`
-    <h3 class="sheet-title">Adjust start time</h3>
+    <h3 class="sheet-title">Adjust times</h3>
     <form id="adjForm">
       ${timeField('start', cur, which === 'nurse' ? 'Nursing started at' : 'Fell asleep at')}
       <p class="muted small">${which === 'nurse' ? 'Extra time is added to the side currently selected.' : ''}</p>
+      ${timeField('end', null, which === 'nurse' ? 'Nursing ended at (optional)' : 'Woke up at (optional)', true)}
+      <p class="muted small">Set an end time to stop the timer and save it as of that time.</p>
       <div class="sheet-actions"><button type="button" class="btn" data-action="sheet-close">Cancel</button><button class="btn primary">Update</button></div>
     </form>`);
   $('#adjForm').onsubmit = async ev => {
     ev.preventDefault();
-    const t = fromLocalInput(new FormData(ev.target).get('start'));
+    const fd = new FormData(ev.target);
+    const t = fromLocalInput(fd.get('start')), end = fromLocalInput(fd.get('end'));
     if (!isFinite(t) || t > Date.now()) { toast('Pick a time in the past'); return; }
+    if (isFinite(end) && end <= t) { toast('End time must be after start time'); return; }
+    if (isFinite(end) && end > Date.now() + MIN) { toast('End time is in the future'); return; }
     if (which === 'nurse') {
       const n = S.timers.nurse; if (!n) return closeSheet();
       const diff = n.startedAt - t, k = n.side === 'L' ? 'left' : 'right';
       n[k] = Math.max(0, n[k] + diff); n.startedAt = t;
     } else if (S.timers.sleep) S.timers.sleep.start = t;
-    await saveTimers(); closeSheet(); render();
+    await saveTimers(); closeSheet();
+    if (isFinite(end)) { const at = Math.min(end, Date.now()); await (which === 'nurse' ? nurseSave(at) : sleepSave(at)); }
+    else render();
   };
 }
 
@@ -646,6 +705,7 @@ function renderSettings() {
       <label class="field" style="margin-bottom:4px"><span>Birth date & time</span><input id="setBirth" type="datetime-local" value="${st.birth ? toLocalInput(st.birth) : ''}"></label>
       <div class="note" style="margin-top:4px">Used for day-of-life diaper goals and age-based sleep predictions.</div>
     </div>
+    ${renderSyncCard()}
     <h2>Preferences</h2>
     <div class="card">
       <div class="set-row"><div><div class="k">Bottle & pump units</div></div>${seg('vol', [['ml', 'ml'], ['oz', 'oz']])}</div>
@@ -654,7 +714,7 @@ function renderSettings() {
     </div>
     <h2>Your data</h2>
     <div class="card">
-      <div class="set-row"><div><div class="k">${S.entries.length} entries</div><div class="d">Stored only on this phone. ${S.persisted === true ? 'Protected from automatic cleanup ✓' : S.persisted === false ? 'Install the app to protect storage.' : ''}</div></div></div>
+      <div class="set-row"><div><div class="k">${S.entries.length} entries</div><div class="d">${Sync?.connected ? 'Saved on this phone and synced to your shared log.' : 'Stored only on this phone.'} ${S.persisted === true ? 'Protected from automatic cleanup ✓' : S.persisted === false ? 'Install the app to protect storage.' : ''}</div></div></div>
       <div class="set-row"><div><div class="k">Last backup</div><div class="d">${st.lastBackup ? fmtDateTime(st.lastBackup) : 'Never'}</div></div></div>
       <div class="stack" style="margin-top:6px">
         <button class="btn primary" data-action="export-json">💾 Back up (save / share file)</button>
@@ -669,11 +729,44 @@ function renderSettings() {
     </div>` : ''}
     <h2>Danger zone</h2>
     <div class="card"><button class="btn danger full" data-action="wipe">Delete all data</button></div>
-    <p class="muted small" style="text-align:center;margin-top:18px">Sprout Baby Log · private & offline · no account, no subscription</p>`;
+    <p class="muted small" style="text-align:center;margin-top:18px">Sprout Baby Log · works offline · no subscription</p>`;
+}
+function renderSyncCard() {
+  const head = '<h2>Shared log</h2>';
+  if (!Sync) {
+    const msg = { unconfigured: 'Log together with your partner on both phones. To turn this on, fill in <b>firebase-config.js</b> (see the README).', failed: 'Couldn’t load sharing. Check your connection and reopen the app.' }[S.syncState] || 'Loading…';
+    return `${head}<div class="card"><div class="small">${msg}</div></div>`;
+  }
+  const i = Sync.info(), err = i.error ? `<div class="note" style="color:var(--danger)">Problem: ${esc(i.error)}</div>` : '';
+  if (i.status === 'loading') return `${head}<div class="card"><div class="small">Connecting…</div>${err}</div>`;
+  if (i.status === 'signedOut') return `${head}<div class="card">
+      <div class="small" style="margin-bottom:10px">Sign in so you and your partner both see the same log, live, on your own phones.</div>
+      <button class="btn primary full" data-action="sync-signin">Sign in with Google</button>${err}</div>`;
+  const who = `<div class="set-row"><div><div class="k">Signed in</div><div class="d">${esc(i.user.email)}</div></div><button class="btn" data-action="sync-signout">Sign out</button></div>`;
+  if (i.status === 'noFamily') {
+    const inv = i.invites.map(f => {
+      const owner = (f.memberInfo && f.memberInfo[f.owner]) || {};
+      return `<button class="btn primary full" data-action="sync-join" data-id="${esc(f.id)}">Join ${esc(owner.name || owner.email || 'shared')}’s log</button>`;
+    }).join('');
+    return `${head}<div class="card">${who}
+      <div class="stack" style="margin-top:8px">${inv}
+        <button class="btn${inv ? '' : ' primary'} full" data-action="sync-create">Create a new shared log</button></div>
+      <div class="note">${inv ? 'You’ve been invited. Join to see the same log.' : 'Partner already created one? Ask them to invite this email, then reopen Settings.'}</div>${err}</div>`;
+  }
+  const f = i.family, info = f.memberInfo || {};
+  const members = (f.members || []).map(u => `<div class="set-row"><div><div class="k">${esc(info[u]?.name || info[u]?.email || 'Member')}</div><div class="d">${esc(info[u]?.email || '')}${u === i.user.uid ? ' · you' : ''}</div></div></div>`).join('');
+  const pending = (f.invites || []).map(e => `<div class="set-row"><div><div class="k">${esc(e)}</div><div class="d">Invited · they need to sign in and tap Join</div></div><button class="btn" data-action="sync-uninvite" data-email="${esc(e)}">Cancel</button></div>`).join('');
+  const status = !i.online ? 'Offline · changes will sync when you’re back online' : i.pending ? 'Syncing…' : 'Synced ✓';
+  return `${head}<div class="card">
+      <div class="set-row"><div><div class="k">Status</div><div class="d">${status}</div></div></div>
+      ${members}${pending}
+      <label class="field" style="margin-top:8px"><span>Invite by Google email</span><input id="inviteEmail" type="email" autocomplete="off" placeholder="partner@gmail.com"></label>
+      <button class="btn full" data-action="sync-invite">Send invite</button>
+      ${who}${err}</div>`;
 }
 function bindSettings() {
-  $('#setName').onchange = async e => { S.settings.babyName = e.target.value.trim() || 'Baby'; await saveSettings(); render(); toast('Saved'); };
-  $('#setBirth').onchange = async e => { const t = fromLocalInput(e.target.value); S.settings.birth = isFinite(t) ? t : null; await saveSettings(); render(); toast('Saved'); };
+  $('#setName').onchange = async e => { S.settings.babyName = e.target.value.trim() || 'Baby'; await saveProfile(); render(); toast('Saved'); };
+  $('#setBirth').onchange = async e => { const t = fromLocalInput(e.target.value); S.settings.birth = isFinite(t) ? t : null; await saveProfile(); render(); toast('Saved'); };
   $('#importFile').onchange = e => { const f = e.target.files[0]; if (f) importBackup(f); e.target.value = ''; };
 }
 
@@ -698,9 +791,9 @@ function closeSheet(fromPop = false) {
 }
 window.addEventListener('popstate', () => { if (sheetOpen) closeSheet(true); });
 
-function timeField(name, t, label = 'Time') {
+function timeField(name, t, label = 'Time', optional = false) {
   const chips = [[0, 'Now'], [5, '5m ago'], [15, '15m ago'], [30, '30m ago'], [60, '1h ago']];
-  return `<label class="field"><span>${label}</span><input type="datetime-local" name="${name}" value="${toLocalInput(t)}" required></label>
+  return `<label class="field"><span>${label}</span><input type="datetime-local" name="${name}" value="${t == null ? '' : toLocalInput(t)}" ${optional ? '' : 'required'}></label>
     <div class="qchips">${chips.map(([m, l]) => `<button type="button" data-ago="${m}" data-for="${name}">${l}</button>`).join('')}</div>`;
 }
 function stepper(name, val, step, unit, dec = 0) {
@@ -726,9 +819,8 @@ function formHTML(type, e) {
     }
     case 'pump': {
       const sv = v => (v != null ? volIn(v) : '');
-      return timeField('start', t, 'Started') + `<div class="two"><div>${label('Left')}${stepper('left', sv(d.left), oz ? 0.25 : 5, '', oz ? 2 : 0)}</div><div>${label('Right')}${stepper('right', sv(d.right), oz ? 0.25 : 5, '', oz ? 2 : 0)}</div></div>`
-        + `<div class="muted small" style="margin:-6px 0 12px">Amounts in ${volUnit()}</div>`
-        + label('Duration (minutes, optional)') + stepper('dur', e?.end ? Math.round((e.end - e.start) / MIN) : '', 5, 'min') + noteField(e?.note);
+      return timeField('start', t, 'Started') + timeField('end', e?.end ?? null, 'Ended (optional)', true) + `<div class="two"><div>${label('Left')}${stepper('left', sv(d.left), oz ? 0.25 : 5, '', oz ? 2 : 0)}</div><div>${label('Right')}${stepper('right', sv(d.right), oz ? 0.25 : 5, '', oz ? 2 : 0)}</div></div>`
+        + `<div class="muted small" style="margin:-6px 0 12px">Amounts in ${volUnit()}</div>` + noteField(e?.note);
     }
     case 'diaper':
       return timeField('start', t) + label('Type') + segField('kind', [['wet', '💧 Wet'], ['dirty', '💩 Dirty'], ['mixed', '💧💩 Both'], ['dry', '⚪ Dry']], d.kind || 'wet')
@@ -736,6 +828,8 @@ function formHTML(type, e) {
     case 'nurse': {
       const m = s => (s != null ? round(s / 60, 1) : '');
       return timeField('start', e?.start ?? now - 20 * MIN, 'Started')
+        + timeField('end', e?.end ?? null, 'Ended (optional)', true)
+        + `<div class="muted small" style="margin:-6px 0 12px">Leave blank to use start + left/right minutes</div>`
         + `<div class="two"><div>${label('Left (min)')}${stepper('left', m(d.left), 1, '')}</div><div>${label('Right (min)')}${stepper('right', m(d.right), 1, '')}</div></div>`
         + label('Ended on') + segField('last', [['L', 'Left'], ['R', 'Right']], d.last || 'L') + noteField(e?.note);
     }
@@ -772,6 +866,14 @@ function readForm(type, form, e) {
   if (!isFinite(start)) throw new Error('Please set a time');
   if (start > Date.now() + 5 * MIN) throw new Error('That time is in the future');
   const out = { id: e?.id, created: e?.created, type, start, end: null, data: {}, note: (fd.get('note') || '').trim() };
+  const optEnd = () => {
+    const end = fromLocalInput(fd.get('end'));
+    if (!isFinite(end)) return null;
+    if (end <= start) throw new Error('End time must be after start time');
+    if (end > Date.now() + 5 * MIN) throw new Error('End time is in the future');
+    if (end - start > 12 * HOUR) throw new Error('That session is over 12 hours — check the times');
+    return end;
+  };
   const d = out.data;
   switch (type) {
     case 'bottle': {
@@ -782,14 +884,16 @@ function readForm(type, form, e) {
       const l = num('left'), r = num('right');
       if (!l && !r) throw new Error('Enter an amount for at least one side');
       d.left = l ? volToMl(l) : 0; d.right = r ? volToMl(r) : 0;
-      const dur = num('dur'); if (dur) out.end = start + dur * MIN; break;
+      out.end = optEnd(); break;
     }
     case 'diaper': d.kind = fd.get('kind') || 'wet'; if (fd.get('color')) d.color = fd.get('color'); break;
     case 'nurse': {
       const l = num('left') || 0, r = num('right') || 0;
       if (!l && !r) throw new Error('Enter minutes for at least one side');
       d.left = Math.round(l * 60); d.right = Math.round(r * 60); d.last = fd.get('last') || 'L';
-      out.end = start + (d.left + d.right) * 1000; break;
+      const end = optEnd();
+      if (end != null && end - start < (d.left + d.right) * 1000 - MIN) throw new Error('Left + right minutes are longer than the time between start and end');
+      out.end = end ?? start + (d.left + d.right) * 1000; break;
     }
     case 'sleep': {
       const end = fromLocalInput(fd.get('end'));
@@ -930,13 +1034,14 @@ async function importBackup(file) {
     if (!Array.isArray(data.entries)) throw new Error('bad');
     const valid = data.entries.filter(e => e && e.id && TYPES[e.type] && isFinite(e.start) && e.data);
     if (!confirm(`Restore ${valid.length} entries from this backup?\nEntries you already have are kept; matching ones are updated.`)) return;
-    await DB.putMany(valid);
+    valid.forEach(e => { e.updated = Date.now(); });
+    await DB.putMany(valid); Sync?.pushMany(valid);
     const byId = new Map(S.entries.map(e => [e.id, e]));
     valid.forEach(e => byId.set(e.id, e));
     S.entries = [...byId.values()]; sortEntries();
     if (data.settings && (!S.settings.birth || S.settings.babyName === 'Baby')) {
       S.settings = { ...DEFAULTS, ...data.settings, theme: S.settings.theme };
-      await saveSettings();
+      await saveProfile();
     }
     render(); toast(`Restored ${valid.length} entries ✓`);
   } catch (_) { toast('That file isn’t a valid Sprout backup'); }
@@ -962,9 +1067,9 @@ const ACTIONS = {
   'toggle-theme': async () => { S.settings.theme = effectiveDark() ? 'light' : 'dark'; await saveSettings(); render(); },
   'nurse-tap': b => nurseTap(b.dataset.side),
   'nurse-pause': nursePause,
-  'nurse-save': nurseSave,
+  'nurse-save': () => nurseSave(),
   'sleep-start': sleepStart,
-  'sleep-save': sleepSave,
+  'sleep-save': () => sleepSave(),
   'timer-discard': b => timerDiscard(b.dataset.which),
   'timer-adjust': b => timerAdjust(b.dataset.which),
   diaper: async b => {
@@ -987,11 +1092,36 @@ const ACTIONS = {
   install: async () => { if (!S.installPrompt) return; S.installPrompt.prompt(); await S.installPrompt.userChoice; S.installPrompt = null; render(); },
   'dismiss-install': async () => { S.settings.installDismissed = true; await saveSettings(); render(); },
   wipe: async () => {
-    if (!confirm('Delete ALL entries and settings? This cannot be undone.')) return;
+    const shared = Sync?.connected;
+    if (!confirm(shared ? 'Delete ALL entries from the SHARED log? They will be deleted on every phone in your family. This cannot be undone.' : 'Delete ALL entries and settings? This cannot be undone.')) return;
     if (!confirm('Are you sure? Consider making a backup first.')) return;
+    if (shared) { const now = Date.now(); Sync.pushMany(S.entries.map(e => ({ id: e.id, deleted: true, updated: now }))); }
     await DB.clear(); S.entries = []; S.timers = { sleep: null, nurse: null }; S.settings = { ...DEFAULTS };
-    await saveSettings(); await saveTimers(); render(); toast('All data deleted');
+    await saveProfile(); await saveTimers(); render(); toast('All data deleted');
   },
+  'sync-signin': () => Sync?.signIn(),
+  'sync-signout': async () => {
+    if (!confirm('Stop sharing on this phone? Your log stays on this phone, but new entries won’t sync until you sign in again.')) return;
+    await Sync.signOut(); toast('Signed out');
+  },
+  'sync-create': async b => {
+    if (!confirm(`Create a shared log${S.entries.length ? ` with the ${S.entries.length} entries on this phone` : ''}? Your log will be stored in your Firebase project so your partner can see it.`)) return;
+    b.disabled = true;
+    try { await Sync.createFamily(); toast('Shared log created ✓ Now invite your partner.'); }
+    catch (err) { b.disabled = false; toast(`Couldn’t create shared log (${err.code || err.message})`); }
+  },
+  'sync-join': async b => {
+    if (S.entries.length && !confirm(`The ${S.entries.length} entries on this phone will be added to the shared log. Continue?`)) return;
+    b.disabled = true;
+    try { await Sync.joinFamily(b.dataset.id); toast('Joined shared log ✓'); }
+    catch (err) { b.disabled = false; toast(`Couldn’t join (${err.code || err.message})`); }
+  },
+  'sync-invite': () => {
+    const inp = $('#inviteEmail'), email = inp.value.trim();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { toast('Enter the email they use for Google'); inp.focus(); return; }
+    Sync.invite(email); inp.value = ''; inp.blur(); toast(`Invited ${email}`);
+  },
+  'sync-uninvite': b => Sync.uninvite(b.dataset.email),
 };
 document.addEventListener('click', ev => {
   const el = ev.target.closest('[data-action]');
@@ -1034,6 +1164,19 @@ async function boot() {
     try { S.persisted = (await navigator.storage.persisted()) || (await navigator.storage.persist()); } catch (_) {}
   }
   if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
+  startSync();
+}
+async function startSync() {
+  try {
+    const config = (await import('./firebase-config.js')).default;
+    if (!config || !config.apiKey) { S.syncState = 'unconfigured'; return; }
+    S.syncState = 'loading';
+    Sync = await (await import('./sync.js')).start(config, syncBridge);
+  } catch (err) {
+    console.warn('Shared log unavailable', err);
+    S.syncState = 'failed';
+  }
+  renderSoon();
 }
 boot();
 })();
